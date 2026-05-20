@@ -24,7 +24,7 @@
 // from MCPs. Pull-on-chat is reliable, survives stdio child restarts, and
 // works without changing LibreChat core.
 
-process.stderr.write('[family-cron-mcp] booting v0.1.0\n');
+process.stderr.write('[family-cron-mcp] booting v0.1.1\n');
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -47,10 +47,23 @@ const MONGODB_URI = normalizeMongoUri(RAW_URI);
 const DB_NAME = process.env.CRON_DB || 'test';
 const COLLECTION_NAME = process.env.CRON_COLLECTION || 'family_reminders';
 
-const USER_ID = process.env.LIBRECHAT_USER_ID || '';
-const USER_NAME = process.env.LIBRECHAT_USER_USERNAME || process.env.LIBRECHAT_USER_EMAIL || 'unknown';
-const USER_ROLE = (process.env.LIBRECHAT_USER_ROLE || 'USER').toUpperCase();
+// LibreChat does TWO kinds of MCP spawns:
+//   1. INSPECTION on startup — to enumerate tools. No user context.
+//      `{{LIBRECHAT_USER_ID}}` env passes through UNSUBSTITUTED as a literal.
+//   2. PER-CHAT — when a logged-in user opens the MCP toggle. Real values.
+// Detect (1) and skip everything that needs identity (rehydrate, Mongo writes).
+function isTemplateLiteral(s) {
+  return typeof s === 'string' && s.startsWith('{{') && s.endsWith('}}');
+}
+
+const RAW_USER_ID = process.env.LIBRECHAT_USER_ID || '';
+const USER_ID = isTemplateLiteral(RAW_USER_ID) ? '' : RAW_USER_ID;
+const RAW_USERNAME = process.env.LIBRECHAT_USER_USERNAME || process.env.LIBRECHAT_USER_EMAIL || 'unknown';
+const USER_NAME = isTemplateLiteral(RAW_USERNAME) ? 'inspector' : RAW_USERNAME;
+const RAW_ROLE = process.env.LIBRECHAT_USER_ROLE || 'USER';
+const USER_ROLE = (isTemplateLiteral(RAW_ROLE) ? 'USER' : RAW_ROLE).toUpperCase();
 const IS_ADMIN = USER_ROLE === 'ADMIN';
+const IS_INSPECTION = !USER_ID;  // No real user → we're being probed for tool list.
 
 function redactUri(uri) {
   if (!uri) return '(empty)';
@@ -359,7 +372,7 @@ server.registerTool(
 // they'll fire when user B opens a chat — not earlier. This is acceptable for
 // a family chatbot but worth flagging if usage grows.
 async function rehydrateUserJobs() {
-  if (!USER_ID) return;
+  if (IS_INSPECTION || !USER_ID) return;
   try {
     const col = await getCollection();
     const docs = await col
@@ -375,8 +388,12 @@ async function rehydrateUserJobs() {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  await rehydrateUserJobs();
-  process.stderr.write(`[family-cron-mcp] ready (user=${USER_NAME}, role=${USER_ROLE})\n`);
+  if (IS_INSPECTION) {
+    process.stderr.write('[family-cron-mcp] inspection mode (no user) — tools advertised, no Mongo touched\n');
+  } else {
+    await rehydrateUserJobs();
+    process.stderr.write(`[family-cron-mcp] ready (user=${USER_NAME}, role=${USER_ROLE})\n`);
+  }
 }
 
 main().catch((err) => {
