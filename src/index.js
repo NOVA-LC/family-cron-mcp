@@ -24,7 +24,7 @@
 // from MCPs. Pull-on-chat is reliable, survives stdio child restarts, and
 // works without changing LibreChat core.
 
-process.stderr.write('[family-cron-mcp] booting v0.1.2\n');
+process.stderr.write('[family-cron-mcp] booting v0.1.3\n');
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -107,20 +107,96 @@ try {
   process.exit(2);
 }
 
+// In-memory fallback used when Mongo auth fails (a project-wide issue right
+// now — Tyler-Computer's Mongo got initialized with a literal template-string
+// password). Reminders in memory don't survive redeploys; we surface this
+// caveat in tool responses so users know.
+const memoryStore = new Map(); // id (string) -> reminder doc
+let mongoBroken = false;
 let collection = null;
-const activeJobs = new Map(); // reminderId -> cron task handle
+const activeJobs = new Map();  // reminderId -> { stop() } handle
 
 async function getCollection() {
+  if (mongoBroken) return null;
   if (collection) return collection;
-  await mongo.connect();
-  collection = mongo.db(DB_NAME).collection(COLLECTION_NAME);
-  await Promise.all([
-    collection.createIndex({ user_id: 1, status: 1, fire_at: 1 }),
-    collection.createIndex({ status: 1 }),
-    collection.createIndex({ created_at: -1 }),
-  ]).catch((err) => process.stderr.write(`[family-cron-mcp] index warning: ${err.message}\n`));
-  return collection;
+  try {
+    await mongo.connect();
+    collection = mongo.db(DB_NAME).collection(COLLECTION_NAME);
+    await Promise.all([
+      collection.createIndex({ user_id: 1, status: 1, fire_at: 1 }),
+      collection.createIndex({ status: 1 }),
+      collection.createIndex({ created_at: -1 }),
+    ]).catch((err) => process.stderr.write(`[family-cron-mcp] index warning: ${err.message}\n`));
+    return collection;
+  } catch (err) {
+    process.stderr.write(`[family-cron-mcp] Mongo unavailable, using in-memory store: ${err.message}\n`);
+    mongoBroken = true;
+    return null;
+  }
 }
+
+// Generate a Mongo-ObjectId-like id without requiring a Mongo connection.
+function fakeId() {
+  return Math.floor(Date.now() / 1000).toString(16).padStart(8, '0')
+    + Math.random().toString(16).slice(2, 18).padStart(16, '0');
+}
+
+// Storage abstraction: try Mongo, fall back to memory.
+const store = {
+  async insertOne(doc) {
+    const col = await getCollection();
+    if (col) {
+      const r = await col.insertOne(doc);
+      return r.insertedId;
+    }
+    const id = fakeId();
+    memoryStore.set(id, { _id: id, ...doc });
+    return id;
+  },
+  async updateOne(filter, update) {
+    const col = await getCollection();
+    if (col) return col.updateOne(filter, update);
+    const id = filter._id?.toString?.() || filter._id;
+    const doc = memoryStore.get(id);
+    if (!doc) return { matchedCount: 0 };
+    if (update.$set) Object.assign(doc, update.$set);
+    if (update.$inc) {
+      for (const [k, v] of Object.entries(update.$inc)) doc[k] = (doc[k] || 0) + v;
+    }
+    if (update.$push) {
+      for (const [k, v] of Object.entries(update.$push)) {
+        if (!Array.isArray(doc[k])) doc[k] = [];
+        doc[k].push(v);
+      }
+    }
+    return { matchedCount: 1 };
+  },
+  async findById(idStr) {
+    const col = await getCollection();
+    if (col) {
+      try { return await col.findOne({ _id: new ObjectId(idStr) }); }
+      catch { return null; }
+    }
+    return memoryStore.get(idStr) || null;
+  },
+  async findUserPending(user_id) {
+    const col = await getCollection();
+    if (col) {
+      return col.find({ user_id, status: 'pending' }).toArray();
+    }
+    return [...memoryStore.values()].filter(d => d.user_id === user_id && d.status === 'pending');
+  },
+  async listForUser(user_id, statuses, limit) {
+    const col = await getCollection();
+    if (col) {
+      return col.find({ user_id, status: { $in: statuses } }).sort({ created_at: -1 }).limit(limit).toArray();
+    }
+    return [...memoryStore.values()]
+      .filter(d => d.user_id === user_id && statuses.includes(d.status))
+      .sort((a, b) => b.created_at - a.created_at)
+      .slice(0, limit);
+  },
+};
 
 // Parse a "when" string into either { cron: '0 7 * * *' } (recurring) or
 // { fire_at: Date } (one-shot). Accepts:
@@ -180,27 +256,25 @@ function requireIdentity() {
   return null;
 }
 
-// Mark a reminder as fired in Mongo. Called from cron callbacks.
+// Mark a reminder as fired. Called from cron callbacks.
 async function fireReminder(reminderId, isRecurring) {
   try {
-    const col = await getCollection();
     const now = new Date();
+    const idStr = reminderId.toString();
     if (isRecurring) {
-      // Recurring: keep status=pending, push to fire_history.
-      await col.updateOne(
+      await store.updateOne(
         { _id: reminderId },
         { $set: { last_fired_at: now }, $push: { fire_history: now }, $inc: { fire_count: 1 } },
       );
     } else {
-      // One-shot: flip to fired.
-      await col.updateOne(
+      await store.updateOne(
         { _id: reminderId },
         { $set: { status: 'fired', fired_at: now }, $push: { fire_history: now } },
       );
-      const job = activeJobs.get(reminderId.toString());
-      if (job) { try { job.stop(); } catch {} activeJobs.delete(reminderId.toString()); }
+      const job = activeJobs.get(idStr);
+      if (job) { try { job.stop(); } catch {} activeJobs.delete(idStr); }
     }
-    process.stderr.write(`[family-cron-mcp] fired reminder ${reminderId} (${isRecurring ? 'recurring' : 'one-shot'})\n`);
+    process.stderr.write(`[family-cron-mcp] fired reminder ${idStr} (${isRecurring ? 'recurring' : 'one-shot'})\n`);
   } catch (err) {
     process.stderr.write(`[family-cron-mcp] fire error for ${reminderId}: ${err.message}\n`);
   }
@@ -255,7 +329,6 @@ server.registerTool(
     try { parsed = parseWhen(when); }
     catch (err) { return { content: [{ type: 'text', text: err.message }], isError: true }; }
 
-    const col = await getCollection();
     const doc = {
       user_id: USER_ID,
       user_name: USER_NAME,
@@ -269,17 +342,20 @@ server.registerTool(
       fire_count: 0,
       created_at: new Date(),
     };
-    const result = await col.insertOne(doc);
-    doc._id = result.insertedId;
+    const insertedId = await store.insertOne(doc);
+    doc._id = insertedId;
     registerJob(doc);
 
     const fireDesc = parsed.cron
       ? `cron "${parsed.cron}" (recurring)`
       : `${parsed.fire_at.toISOString()} (one-shot)`;
+    const note = mongoBroken
+      ? '\n  NOTE: Mongo is currently unavailable (project-wide issue). This reminder is held in-memory; it will fire normally but not survive a redeploy.'
+      : '';
     return {
       content: [{
         type: 'text',
-        text: `Reminder saved. id=${result.insertedId}\n  when: ${fireDesc}\n  message: ${message}`,
+        text: `Reminder saved. id=${insertedId}\n  when: ${fireDesc}\n  message: ${message}${note}`,
       }],
     };
   },
@@ -299,17 +375,9 @@ server.registerTool(
   async ({ include_fired }) => {
     const guard = requireIdentity();
     if (guard) return guard;
-    const col = await getCollection();
     const includeFired = include_fired !== false;
-    const statusFilter = includeFired
-      ? { $in: ['pending', 'fired'] }
-      : 'pending';
-
-    const docs = await col
-      .find({ user_id: USER_ID, status: statusFilter })
-      .sort({ created_at: -1 })
-      .limit(20)
-      .toArray();
+    const statuses = includeFired ? ['pending', 'fired'] : ['pending'];
+    const docs = await store.listForUser(USER_ID, statuses, 20);
 
     if (docs.length === 0) {
       return { content: [{ type: 'text', text: 'No reminders.' }] };
@@ -338,16 +406,13 @@ server.registerTool(
   async ({ reminder_id }) => {
     const guard = requireIdentity();
     if (guard) return guard;
-    let oid;
-    try { oid = new ObjectId(reminder_id); }
-    catch { return { content: [{ type: 'text', text: `Invalid reminder_id: ${reminder_id}` }], isError: true }; }
-    const col = await getCollection();
-    const doc = await col.findOne({ _id: oid });
+    const doc = await store.findById(reminder_id);
     if (!doc) return { content: [{ type: 'text', text: `No reminder with id ${reminder_id}.` }], isError: true };
     if (!IS_ADMIN && doc.user_id !== USER_ID) {
       return { content: [{ type: 'text', text: `Not your reminder.` }], isError: true };
     }
-    await col.updateOne({ _id: oid }, { $set: { status: 'acknowledged', acknowledged_at: new Date() } });
+    const idForUpdate = mongoBroken ? reminder_id : new ObjectId(reminder_id);
+    await store.updateOne({ _id: idForUpdate }, { $set: { status: 'acknowledged', acknowledged_at: new Date() } });
     return { content: [{ type: 'text', text: `Acknowledged. id=${reminder_id}` }] };
   },
 );
@@ -364,18 +429,15 @@ server.registerTool(
   async ({ reminder_id }) => {
     const guard = requireIdentity();
     if (guard) return guard;
-    let oid;
-    try { oid = new ObjectId(reminder_id); }
-    catch { return { content: [{ type: 'text', text: `Invalid reminder_id: ${reminder_id}` }], isError: true }; }
-    const col = await getCollection();
-    const doc = await col.findOne({ _id: oid });
+    const doc = await store.findById(reminder_id);
     if (!doc) return { content: [{ type: 'text', text: `No reminder with id ${reminder_id}.` }], isError: true };
     if (!IS_ADMIN && doc.user_id !== USER_ID) {
       return { content: [{ type: 'text', text: `Not your reminder.` }], isError: true };
     }
     const job = activeJobs.get(reminder_id);
     if (job) { try { job.stop(); } catch {} activeJobs.delete(reminder_id); }
-    await col.updateOne({ _id: oid }, { $set: { status: 'cancelled', cancelled_at: new Date() } });
+    const idForUpdate = mongoBroken ? reminder_id : new ObjectId(reminder_id);
+    await store.updateOne({ _id: idForUpdate }, { $set: { status: 'cancelled', cancelled_at: new Date() } });
     return { content: [{ type: 'text', text: `Cancelled. id=${reminder_id}` }] };
   },
 );
@@ -391,12 +453,9 @@ server.registerTool(
 async function rehydrateUserJobs() {
   if (IS_INSPECTION || !USER_ID) return;
   try {
-    const col = await getCollection();
-    const docs = await col
-      .find({ user_id: USER_ID, status: 'pending' })
-      .toArray();
+    const docs = await store.findUserPending(USER_ID);
     for (const d of docs) registerJob(d);
-    process.stderr.write(`[family-cron-mcp] rehydrated ${docs.length} pending reminder(s) for user ${USER_NAME}\n`);
+    process.stderr.write(`[family-cron-mcp] rehydrated ${docs.length} pending reminder(s) for ${USER_NAME}\n`);
   } catch (err) {
     process.stderr.write(`[family-cron-mcp] rehydrate error: ${err.message}\n`);
   }
