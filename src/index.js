@@ -24,7 +24,7 @@
 // from MCPs. Pull-on-chat is reliable, survives stdio child restarts, and
 // works without changing LibreChat core.
 
-process.stderr.write('[family-cron-mcp] booting v0.1.1\n');
+process.stderr.write('[family-cron-mcp] booting v0.1.2\n');
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -50,20 +50,37 @@ const COLLECTION_NAME = process.env.CRON_COLLECTION || 'family_reminders';
 // LibreChat does TWO kinds of MCP spawns:
 //   1. INSPECTION on startup — to enumerate tools. No user context.
 //      `{{LIBRECHAT_USER_ID}}` env passes through UNSUBSTITUTED as a literal.
-//   2. PER-CHAT — when a logged-in user opens the MCP toggle. Real values.
-// Detect (1) and skip everything that needs identity (rehydrate, Mongo writes).
+//   2. PER-CHAT — when a logged-in user opens the MCP toggle. SHOULD have
+//      real values, but in practice LibreChat's substitution is unreliable
+//      (only works for certain "blessed" MCPs that were configured at boot).
+//      family-cron in real chat sessions ALSO receives literal {{...}}.
+// Falls back to a shared "family" user when the substitution doesn't happen.
+// That breaks per-user scoping (everyone sees everyone's reminders) but the
+// MCP works, which is better than silently failing every call.
 function isTemplateLiteral(s) {
   return typeof s === 'string' && s.startsWith('{{') && s.endsWith('}}');
 }
 
 const RAW_USER_ID = process.env.LIBRECHAT_USER_ID || '';
-const USER_ID = isTemplateLiteral(RAW_USER_ID) ? '' : RAW_USER_ID;
-const RAW_USERNAME = process.env.LIBRECHAT_USER_USERNAME || process.env.LIBRECHAT_USER_EMAIL || 'unknown';
-const USER_NAME = isTemplateLiteral(RAW_USERNAME) ? 'inspector' : RAW_USERNAME;
+const RAW_USERNAME = process.env.LIBRECHAT_USER_USERNAME || process.env.LIBRECHAT_USER_EMAIL || '';
 const RAW_ROLE = process.env.LIBRECHAT_USER_ROLE || 'USER';
+
+// Detect inspection mode = NO env vars set at all (not even template literals).
+const IS_INSPECTION = !RAW_USER_ID && !RAW_USERNAME;
+
+// Did substitution actually happen, or did we get the literal template?
+const SUBSTITUTION_BROKEN = isTemplateLiteral(RAW_USER_ID);
+
+// If substitution failed but we're clearly in per-chat mode (env vars present
+// but unsubstituted), fall back to a shared family pseudo-user.
+const USER_ID = SUBSTITUTION_BROKEN
+  ? 'family-shared'
+  : (RAW_USER_ID || '');
+const USER_NAME = isTemplateLiteral(RAW_USERNAME)
+  ? 'family-shared'
+  : (RAW_USERNAME || 'unknown');
 const USER_ROLE = (isTemplateLiteral(RAW_ROLE) ? 'USER' : RAW_ROLE).toUpperCase();
 const IS_ADMIN = USER_ROLE === 'ADMIN';
-const IS_INSPECTION = !USER_ID;  // No real user → we're being probed for tool list.
 
 function redactUri(uri) {
   if (!uri) return '(empty)';

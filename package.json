@@ -1,6 +1,6 @@
 {
   "name": "@nova-lc/family-cron-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Per-user scheduled-reminder MCP server for Tyler-Computer LibreChat. Custom because jolks/mcp-cron (Go/glibc) segfaults on Alpine and schedule-task-mcp needs Node 22+ for node:sqlite — this one is pure Node 20 + Mongo.",
   "type": "module",
   "bin": {
